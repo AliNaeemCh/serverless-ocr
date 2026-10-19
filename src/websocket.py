@@ -12,9 +12,6 @@ websocket_client = boto3.client(
 )
 
 
-
-from botocore.exceptions import ClientError
-
 def send_websocket_message(
     connection_id,
     message,
@@ -32,26 +29,10 @@ def send_websocket_message(
 
         return True
 
-    except ClientError as e:
-
-        error_code = e.response.get("Error", {}).get("Code")
-
-        if error_code == "GoneException":
-            logger.warning(
-                "WebSocket connection is gone: %s",
-                connection_id,
-            )
-            return False
-
-        logger.exception(
-            "Failed to send WebSocket message (connection_id=%s)",
-            connection_id,
-        )
-        raise
-
     except Exception:
         logger.exception(
-            "Unexpected WebSocket error (connection_id=%s)",
+            "Failed to send WebSocket message (connection_id=%s). "
+            "Continuing processing.",
             connection_id,
         )
-        raise
+        return False
