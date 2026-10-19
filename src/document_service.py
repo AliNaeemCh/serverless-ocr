@@ -14,21 +14,19 @@ from files import image_to_gemini_format
 logger = logging.getLogger(__name__)
 
 
+
 def on_progress(
     connection_id,
     page,
     completed,
     total,
 ):
-
     message = {
         "status": "progress",
         "page": page,
         "completed": completed,
         "total": total,
-        "percent": round(
-            completed / total * 100
-        ),
+        "percent": round(completed / total * 100),
     }
 
     logger.info(
@@ -44,18 +42,21 @@ def on_progress(
     )
 
 
+
 async def process_pdf_pages(
     file_path: str,
     connection_id: str,
+    deadline_sec: float = float("inf")
 ):
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + deadline_sec
 
     tasks = deque()
     results = []
     completed = 0
 
-    total_pages = get_pdf_page_count(
-        file_path
-    )
+    total_pages = get_pdf_page_count(file_path)
 
     logger.info(
         "Processing PDF (pages=%d, max_concurrency=%d)",
@@ -63,42 +64,47 @@ async def process_pdf_pages(
         config.MAX_CONCURRENCY,
     )
 
+    def collect_done(done_tasks):
+        nonlocal completed
+
+        for task in done_tasks:
+            page = next(
+                page for page, t in tasks if t is task
+            )
+
+            result = task.result()
+            results.append((page, result))
+            completed += 1
+
+            on_progress(
+                connection_id,
+                page,
+                completed,
+                total_pages,
+            )
+
+    timed_out = False
+
     for page_number, page_img in enumerate(
-        iterate_pdf_as_images(
-            file_path=file_path
-        ),
+        iterate_pdf_as_images(file_path=file_path),
         start=1,
     ):
+
+        remaining = deadline - loop.time()
+
+        if remaining <= 0:
+            timed_out = True
+            break
 
         if len(tasks) >= config.MAX_CONCURRENCY:
 
             done, pending = await asyncio.wait(
                 [task for _, task in tasks],
+                timeout=remaining,
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            for task in done:
-
-                page_number_ = next(
-                    page
-                    for page, t in tasks
-                    if t is task
-                )
-
-                result = await task
-
-                results.append(
-                    (page_number_, result)
-                )
-
-                completed += 1
-
-                on_progress(
-                    connection_id,
-                    page_number_,
-                    completed,
-                    total_pages,
-                )
+            collect_done(done)
 
             tasks = deque(
                 (page, task)
@@ -106,10 +112,11 @@ async def process_pdf_pages(
                 if task in pending
             )
 
-        logger.info(
-            "Started processing page %d",
-            page_number,
-        )
+            if not done and pending:
+                timed_out = True
+                break
+
+        logger.info("Started processing page %d", page_number)
 
         task = asyncio.create_task(
             call_gemini(
@@ -121,41 +128,25 @@ async def process_pdf_pages(
             )
         )
 
-        tasks.append(
-            (page_number, task)
-        )
+        tasks.append((page_number, task))
 
-    # Finish remaining tasks
+    # Finish remaining tasks, respecting deadline
 
-    while tasks:
+    while tasks and not timed_out:
+
+        remaining = deadline - loop.time()
+
+        if remaining <= 0:
+            timed_out = True
+            break
 
         done, pending = await asyncio.wait(
             [task for _, task in tasks],
+            timeout=remaining,
             return_when=asyncio.FIRST_COMPLETED,
         )
 
-        for task in done:
-
-            page_number = next(
-                page
-                for page, t in tasks
-                if t is task
-            )
-
-            result = await task
-
-            results.append(
-                (page_number, result)
-            )
-
-            completed += 1
-
-            on_progress(
-                connection_id,
-                page_number,
-                completed,
-                total_pages,
-            )
+        collect_done(done)
 
         tasks = deque(
             (page, task)
@@ -163,20 +154,28 @@ async def process_pdf_pages(
             if task in pending
         )
 
+        if not done and pending:
+            timed_out = True
+            break
+
+    # Cancel unfinished tasks without waiting
+
+    if timed_out:
+        logger.warning(
+            "Deadline reached. Returning %d/%d completed pages.",
+            completed,
+            total_pages,
+        )
+
+        for _, task in tasks:
+            task.cancel()
+
     # Restore original page order
 
-    results.sort(
-        key=lambda x: x[0]
-    )
+    results.sort(key=lambda x: x[0])
 
-    logger.info(
-        "All PDF pages processed successfully"
-    )
+    return [result for _, result in results]
 
-    return [
-        result
-        for _, result in results
-    ]
 
 
 async def process_document(
@@ -189,6 +188,7 @@ async def process_document(
         results = await process_pdf_pages(
             file_path,
             connection_id,
+            deadline_sec=25
         )
 
         return "\n\n---\n\n".join(results)
